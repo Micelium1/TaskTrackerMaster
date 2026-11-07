@@ -1,4 +1,5 @@
-import { createApp, nextTick } from 'vue/dist/vue.esm-bundler.js';
+import { nextTick } from 'vue';
+import { layoutProcessGraph } from './process-graph.js';
 
 const storageKey = 'tasktracker-token';
 const readToken = () => {
@@ -12,7 +13,7 @@ const persistToken = (token) => {
 };
 const emptyTask = () => ({ name: '', description: '', status_id: '', type: 'general', manager_id: '', deadline: '' });
 
-createApp({
+export default {
     data() {
         return {
             token: readToken(), user: null, booting: true, loading: false, refreshing: false,
@@ -25,7 +26,7 @@ createApp({
             history: [], historyBusy: false, historyError: '', mobileMenu: false, now: Date.now(),
             refreshTimer: null, clockTimer: null, analyticsSequence: 0, groupSequence: 0,
             sessionSequence: 0, historySequence: 0, authSequence: 0, mutationSequence: 0,
-            refreshSequence: 0, sessionError: '', returnFocus: null, clockOffset: 0,
+            refreshSequence: 0, groupRequestSequence: 0, sessionError: '', returnFocus: null, clockOffset: 0,
         };
     },
     computed: {
@@ -58,7 +59,7 @@ createApp({
         doneCount() { return this.tasks.filter((task) => task.completed).length; },
         statusChanged() { return !this.editingTask || Number(this.taskForm.status_id) !== Number(this.editingTask.status_id); },
         selectedStatus() { return this.statuses.find((status) => status.id === Number(this.taskForm.status_id)); },
-        graphNodes() {
+        graphLayout() {
             const nodes = new Map();
             for (const status of this.analytics?.statuses || []) nodes.set(status.key || `status:${status.status_id}`, { ...status, key: status.key || `status:${status.status_id}` });
             for (const edge of this.analytics?.transitions || []) {
@@ -67,23 +68,17 @@ createApp({
                     if (!nodes.has(key)) nodes.set(key, { key, status_id: edge[`${side}_status_id`], name: edge[`${side}_name`], color: '#9ba8be', visits: 0, time_percent: 0 });
                 }
             }
-            return [...nodes.values()].sort((a, b) => {
+            const ordered = [...nodes.values()].sort((a, b) => {
                 const left = this.statuses.find((status) => status.id === a.status_id)?.position || 0;
                 const right = this.statuses.find((status) => status.id === b.status_id)?.position || 0;
                 return left - right;
-            }).map((status, index) => ({ ...status, x: 36 + index * 206, y: 120 }));
+            });
+            return layoutProcessGraph(ordered, this.analytics?.transitions || []);
         },
-        graphWidth() { return Math.max(680, this.graphNodes.length * 206 + 42); },
-        graphEdges() {
-            return (this.analytics?.transitions || []).map((edge) => {
-                const from = this.graphNodes.find((node) => node.key === (edge.from_key || `status:${edge.from_status_id}`));
-                const to = this.graphNodes.find((node) => node.key === (edge.to_key || `status:${edge.to_status_id}`));
-                if (!from || !to) return null;
-                const backward = to.x <= from.x;
-                const x1 = from.x + 82, x2 = to.x + 82, y = backward ? 120 : 172, curve = backward ? 16 : 274;
-                return { ...edge, path: `M ${x1} ${y} C ${x1} ${curve}, ${x2} ${curve}, ${x2} ${y}`, labelX: (x1 + x2) / 2, labelY: backward ? 40 : 242 };
-            }).filter(Boolean);
-        },
+        graphNodes() { return this.graphLayout.nodes; },
+        graphWidth() { return this.graphLayout.width; },
+        graphHeight() { return this.graphLayout.height; },
+        graphEdges() { return this.graphLayout.edges; },
     },
     async mounted() {
         if (this.token) {
@@ -163,7 +158,7 @@ createApp({
             this.token = ''; persistToken(''); this.user = null; this.groups = []; this.groupId = '';
             this.tasks = []; this.statuses = []; this.members = []; this.analytics = null; this.knownTaskTypes = []; this.knownManagers = [];
             this.groupSequence++; this.analyticsSequence++; this.sessionSequence++; this.historySequence++;
-            this.authSequence++; this.mutationSequence++; this.refreshSequence++;
+            this.authSequence++; this.mutationSequence++; this.refreshSequence++; this.groupRequestSequence++;
             this.loading = false; this.analyticsBusy = false; this.saving = false; this.refreshing = false;
             this.authBusy = false; this.sessionError = ''; this.notice = ''; this.clockOffset = 0; this.mobileMenu = false;
             this.now = Date.now(); this.closeModal();
@@ -183,6 +178,7 @@ createApp({
         },
         beginMutation() {
             if (this.saving) return null;
+            this.groupRequestSequence++;
             this.saving = true; this.formError = '';
             return { ...this.captureContext(), mutation: ++this.mutationSequence };
         },
@@ -198,12 +194,19 @@ createApp({
             finally { if (sequence === this.groupSequence) this.loading = false; }
         },
         async loadGroup(sequence = this.groupSequence) {
-            const id = this.groupId;
-            const [tasks, statuses, members] = await Promise.all([this.api(`/groups/${id}/tasks`), this.api(`/groups/${id}/statuses`), this.api(`/groups/${id}/members`)]);
-            if (sequence !== this.groupSequence || id !== this.groupId) return;
-            this.tasks = tasks; this.statuses = statuses; this.members = members; this.now = Date.now() + this.clockOffset;
-            this.knownTaskTypes = [...new Set([...this.knownTaskTypes, ...tasks.map((task) => task.type)])];
-            if (this.tab === 'analytics') await this.loadAnalytics();
+            if (sequence !== this.groupSequence) return;
+            const context = this.captureContext(), id = context.groupId;
+            const request = ++this.groupRequestSequence;
+            const isCurrent = () => request === this.groupRequestSequence && this.isCurrentContext(context);
+            try {
+                const [tasks, statuses, members] = await Promise.all([this.api(`/groups/${id}/tasks`), this.api(`/groups/${id}/statuses`), this.api(`/groups/${id}/members`)]);
+                if (!isCurrent()) return;
+                this.tasks = tasks; this.statuses = statuses; this.members = members; this.now = Date.now() + this.clockOffset;
+                this.knownTaskTypes = [...new Set([...this.knownTaskTypes, ...tasks.map((task) => task.type)])];
+                if (this.tab === 'analytics') await this.loadAnalytics();
+            } catch (error) {
+                if (isCurrent()) throw error;
+            }
         },
         async refresh() {
             if (!this.groupId || !this.token) return;
@@ -211,7 +214,7 @@ createApp({
             this.refreshing = true; this.error = '';
             const sequence = this.groupSequence;
             try { await this.loadGroup(sequence); }
-            catch (error) { if (sequence === this.groupSequence) this.error = error.message; }
+            catch (error) { if (refresh === this.refreshSequence && sequence === this.groupSequence) this.error = error.message; }
             finally { if (refresh === this.refreshSequence) this.refreshing = false; }
         },
         async setTab(tab) { this.tab = tab; if (tab === 'analytics' && this.groupId) await this.loadAnalytics(); },
@@ -403,7 +406,7 @@ createApp({
                             <div v-if="!analytics.statuses.length" class="empty-state"><span class="empty-symbol">↗</span><h2>Здесь появится ваш процесс</h2><p>Создайте задачи и переводите их между статусами.<br>Отчёт строится по реальной истории этапов.</p></div>
                             <template v-else>
                                 <div class="analytics-two-columns"><article class="panel"><div class="panel-heading"><div><h3>Время по этапам</h3><p>Доля от всего наблюдаемого времени</p></div><span class="panel-kicker">{{ duration(analytics.summary.total_seconds) }}</span></div><div class="status-bars"><div v-for="status in analytics.statuses" :key="status.key || status.status_id" class="status-bar-row"><div class="bar-label"><span><i class="status-dot" :style="{ backgroundColor: status.color }"></i>{{ status.name }}</span><strong>{{ percent(status.time_percent) }}</strong></div><div class="bar-track"><span :style="{ width: Math.min(100, status.time_percent) + '%', backgroundColor: status.color }"></span></div><div class="bar-caption"><span>{{ duration(status.total_seconds) }} · {{ status.visits }} посещений</span><span :class="{ danger: status.debt_seconds > 0 }">Долг {{ duration(status.debt_seconds) }}</span></div></div></div></article><article class="panel"><div class="panel-heading"><div><h3>Типы задач</h3><p>Какая работа чаще застревает</p></div></div><div class="type-list"><div v-for="row in analytics.types" :key="row.type" class="type-row"><div><strong>{{ typeLabel(row.type) }}</strong><span>{{ row.task_count }} задач · ожидание {{ percent(row.waiting_percent) }}</span></div><div><b :class="{ danger: row.debt_percent > 0 }">{{ percent(row.debt_percent) }}</b><span>доля долга</span></div></div></div></article></div>
-                                <article class="panel process-graph-panel"><div class="panel-heading"><div><h3>Граф движения задач</h3><p>Фактические переходы между этапами. Числа на линиях — количество переходов.</p></div><div class="graph-legend"><span><i class="legend-line"></i>Переход</span><span><i class="legend-line rework"></i>Возврат</span><span><i class="legend-debt"></i>Превышение SLA</span></div></div><div class="graph-scroll"><svg :viewBox="'0 0 ' + graphWidth + ' 290'" :style="{ minWidth: graphWidth + 'px' }" class="process-graph" role="img" aria-label="Граф переходов задач между статусами"><defs><marker id="arrow-forward" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#a1aec5"/></marker><marker id="arrow-rework" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#d87065"/></marker></defs><g v-for="(edge, index) in graphEdges" :key="index"><path :d="edge.path" fill="none" :stroke="edge.rework_count > 0 ? '#d87065' : '#a1aec5'" :stroke-dasharray="edge.rework_count > 0 ? '5 4' : undefined" stroke-width="2" :marker-end="edge.rework_count > 0 ? 'url(#arrow-rework)' : 'url(#arrow-forward)'"/><rect :x="edge.labelX - 15" :y="edge.labelY - 13" width="30" height="24" rx="12" fill="#fff"/><text :x="edge.labelX" :y="edge.labelY + 3" text-anchor="middle" :fill="edge.rework_count > 0 ? '#ad4b43' : '#68758a'" font-size="12">{{ edge.count }}</text></g><g v-for="node in graphNodes" :key="node.key"><title>{{ node.name }}: {{ percent(node.time_percent) }} времени; долг {{ percent(node.debt_percent) }} ({{ duration(node.debt_seconds) }})</title><rect :x="node.x" :y="node.y" width="164" height="52" rx="10" :fill="node.debt_seconds > 0 ? '#fff2ed' : '#fff'" :stroke="node.debt_seconds > 0 ? '#d99a83' : node.color" stroke-width="1.5"/><circle :cx="node.x + 15" :cy="node.y + 18" r="4" :fill="node.color"/><text :x="node.x + 26" :y="node.y + 22" fill="#23314b" font-size="12">{{ node.name.length > 18 ? node.name.slice(0, 17) + '…' : node.name }}</text><text :x="node.x + 14" :y="node.y + 40" fill="#7b879a" font-size="11">{{ percent(node.time_percent) }} времени · {{ node.visits }} входов</text></g><text v-if="!graphEdges.length" x="36" y="260" fill="#7b879a" font-size="12">Переходы появятся после первой смены статуса.</text></svg></div></article>
+                                <article class="panel process-graph-panel"><div class="panel-heading"><div><h3>Граф движения задач</h3><p>Фактические переходы между этапами. Числа на линиях — количество переходов.</p></div><div class="graph-legend"><span><i class="legend-line"></i>Переход</span><span><i class="legend-line rework"></i>Возврат</span><span><i class="legend-debt"></i>Превышение SLA</span></div></div><div class="graph-scroll"><svg :viewBox="'0 0 ' + graphWidth + ' ' + graphHeight" :height="graphHeight" :style="{ minWidth: graphWidth + 'px' }" class="process-graph" role="img" aria-label="Граф переходов задач между статусами"><defs><marker id="arrow-forward" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#a1aec5"/></marker><marker id="arrow-rework" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#d87065"/></marker></defs><g v-for="(edge, index) in graphEdges" :key="index"><path :d="edge.path" fill="none" :stroke="edge.rework_count > 0 ? '#d87065' : '#a1aec5'" :stroke-dasharray="edge.rework_count > 0 ? '5 4' : undefined" stroke-width="2" :marker-end="edge.rework_count > 0 ? 'url(#arrow-rework)' : 'url(#arrow-forward)'"/></g><g v-for="(edge, index) in graphEdges" :key="index"><rect :x="edge.labelX - edge.labelWidth / 2" :y="edge.labelY - 13" :width="edge.labelWidth" height="24" rx="12" fill="#fff"/><text :x="edge.labelX" :y="edge.labelY + 3" text-anchor="middle" :fill="edge.rework_count > 0 ? '#ad4b43' : '#68758a'" font-size="12">{{ edge.count }}</text></g><g v-for="node in graphNodes" :key="node.key"><title>{{ node.name }}: {{ percent(node.time_percent) }} времени; долг {{ percent(node.debt_percent) }} ({{ duration(node.debt_seconds) }})</title><rect :x="node.x" :y="node.y" width="164" height="52" rx="10" :fill="node.debt_seconds > 0 ? '#fff2ed' : '#fff'" :stroke="node.debt_seconds > 0 ? '#d99a83' : node.color" stroke-width="1.5"/><circle :cx="node.x + 15" :cy="node.y + 18" r="4" :fill="node.color"/><text :x="node.x + 26" :y="node.y + 22" fill="#23314b" font-size="12">{{ node.name.length > 18 ? node.name.slice(0, 17) + '…' : node.name }}</text><text :x="node.x + 14" :y="node.y + 40" fill="#7b879a" font-size="11">{{ percent(node.time_percent) }} времени · {{ node.visits }} входов</text></g><text v-if="!graphEdges.length" x="36" :y="graphHeight - 18" fill="#7b879a" font-size="12">Переходы появятся после первой смены статуса.</text></svg></div></article>
                                 <article class="panel"><div class="panel-heading"><div><h3>Ответственные менеджеры</h3><p>Менеджер и тип фиксируются при входе в этап; изменения применяются со следующего этапа.</p></div></div><div class="table-scroll"><table class="analytics-table"><thead><tr><th scope="col">Менеджер</th><th scope="col">Задачи</th><th scope="col">Время в этапах</th><th scope="col">Ожидание</th><th scope="col">Сверх SLA</th><th scope="col">Доля долга</th></tr></thead><tbody><tr v-for="manager in analytics.managers" :key="manager.manager_id ?? ('unassigned:' + manager.name)"><th scope="row"><span class="table-person"><span class="mini-avatar">{{ initial(manager.name) }}</span>{{ manager.name || 'Без менеджера' }}</span></th><td>{{ manager.task_count }}</td><td>{{ duration(manager.total_seconds) }}</td><td>{{ duration(manager.waiting_seconds) }}</td><td>{{ duration(manager.debt_seconds) }}</td><td><span class="debt-badge" :class="{ high: manager.debt_percent >= 30 }">{{ percent(manager.debt_percent) }}</span></td></tr></tbody></table></div></article>
                             </template>
                             <div class="methodology"><span>ⓘ</span><p><strong>Как читать отчёт.</strong> Долг процесса = время сверх дедлайнов этапов / всё наблюдаемое время. Это показатель нарушения SLA, а не доказанная потеря производительности. Ожидание считается по категории статуса; возврат — переход на более раннюю позицию. У старых задач учитывается только история после включения наблюдения. В выбранной истории {{ analytics.summary.task_count }} уникальных задач; завершённые этапы не накапливают время.</p></div>
@@ -420,4 +423,4 @@ createApp({
             <div v-else class="task-dialog-body"><form class="dialog-form" @submit.prevent="saveTask"><label>Название задачи<input v-model="taskForm.name" required maxlength="100" placeholder="Что нужно сделать?"></label><label>Описание<textarea v-model="taskForm.description" required maxlength="255" rows="3" placeholder="Контекст, результат и важные детали"></textarea></label><div class="form-row"><label>Статус<select v-model="taskForm.status_id" required @change="taskStatusChanged"><option disabled value="">Выберите статус этой группы</option><option v-for="status in orderedStatuses" :key="status.id" :value="status.id">{{ status.name }}</option></select></label><label>Тип задачи<input v-model="taskForm.type" maxlength="100" required list="task-types" placeholder="general"><datalist id="task-types"><option v-for="type in taskTypes" :key="type" :value="type"></option></datalist></label></div><div v-if="!statuses.length" class="task-status-warning"><p>Сначала создайте статус в этой группе, затем откройте задачу снова и выберите её этап.</p><button type="button" class="text-button" :disabled="saving" @click="closeModal(); newStatus()">Создать статус →</button></div><p v-else-if="editingTask && !taskForm.status_id" class="form-help">Текущий статус не входит в эту группу. Выберите этап для задачи; переход запишется в историю с новым дедлайном.</p><label>Ответственный менеджер<select v-model="taskForm.manager_id"><option value="">Без менеджера</option><option v-for="member in taskManagers" :key="member.id" :value="member.id">{{ member.name }}</option></select></label><p v-if="editingTask" class="form-help">Ответственность и тип в аналитике изменятся со следующего этапа.</p><template v-if="statusChanged"><label>Дедлайн нового этапа <span class="optional-label">необязательно</span><input v-model="taskForm.deadline" type="datetime-local"></label><p class="form-help">Без ручного срока сервер применит SLA: {{ duration((selectedStatus?.sla_minutes || 1440) * 60) }}. Время вводится в вашем часовом поясе. {{ selectedStatus?.category === 'done' ? 'Задача будет завершена и не будет считаться просроченной.' : '' }}</p></template><div v-else class="current-deadline"><span>Дедлайн текущего этапа</span><strong :class="{ danger: editingTask && isExpired(editingTask) }">{{ date(editingTask?.deadline) }}</strong><p>Новый срок задаётся при смене статуса. Редактирование текста не обнуляет просрочку.</p></div><footer class="dialog-footer"><button type="button" class="button secondary" :disabled="saving" @click="closeModal">Отмена</button><button class="button primary" :disabled="saving">{{ saving ? 'Сохраняем…' : 'Сохранить' }}</button></footer></form><aside v-if="editingTask" class="history-panel"><h3>История движения</h3><p class="muted">Время и ответственность на каждом этапе.</p><p v-if="historyBusy" class="muted" role="status">Загрузка истории…</p><div v-else-if="historyError" class="alert alert-error">{{ historyError }}</div><p v-else-if="!history.length" class="muted">История пока не записана.</p><ol v-else class="history-list"><li v-for="entry in history" :key="entry.id"><i class="history-dot" :style="{ backgroundColor: entry.status_color }"></i><div class="history-entry-top"><strong>{{ entry.status_name }}</strong><span v-if="entry.is_rework" class="rework-tag">Возврат</span></div><p>{{ date(entry.entered_at) }} → {{ entry.left_at ? date(entry.left_at) : 'сейчас' }}</p><p>{{ duration((new Date(entry.left_at || now).getTime() - new Date(entry.entered_at).getTime()) / 1000) }} в этапе</p><p class="history-owner">{{ entry.manager_name || 'Без менеджера' }} · {{ typeLabel(entry.task_type) }}</p><p v-if="entry.deadline" class="history-sla">Дедлайн: {{ date(entry.deadline) }}</p></li></ol></aside></div>
         </section></div>
     </div>`,
-}).mount('#app');
+};
